@@ -21,13 +21,16 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(ROOT, "data")
 NEWS = os.path.join(DATA, "news.json")
 STATUS = os.path.join(DATA, "status.json")
-CHANNELS = os.path.join(DATA, "channels.json")
+CHANNELS = os.path.join(DATA, "youtube_channels.json")
 
 PER_FEED = 8          # newest items taken from each source per run
 MAX_AGE_DAYS = 7      # older items are dropped
+VIDEO_AGE_DAYS = 14   # videos stay longer, channels post less often
+SCAN = 40             # how deep to look in feeds that are filtered by topic
 PER_SECTION = 150     # items kept per section
 MAX_NEW = 350         # translation budget per run
-UA = {"User-Agent": "Mozilla/5.0 (compatible; AiBel3arabyBot/1.0)", "Accept-Language": "en-US,en;q=0.8"}
+UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36",
+      "Accept": "application/rss+xml, application/atom+xml, application/xml, text/xml, text/html, */*", "Accept-Language": "en-US,en;q=0.8"}
 
 KEYS = {
     "laptops": r"\b(laptops?|notebooks?|macbook|thinkpad|zenbook|vivobook|xps \d+|chromebook|surface (laptop|pro)|ultrabook|legion|elitebook|ideapad|zephyrus|copilot\+ pcs?|snapdragon x|core ultra|ryzen ai)\b|لابتوب|حاسوب محمول|حواسيب محمولة|ماك ?بوك",
@@ -86,11 +89,10 @@ def parse_date(text):
     if not text:
         return 0
     try:
-        return int(parsedate_to_datetime(text).timestamp())
-    except Exception:  # noqa: BLE001
-        pass
-    try:
-        d = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if re.match(r"\d{4}-\d\d-\d\d", text):
+            d = datetime.fromisoformat(re.sub(r"\.\d+", "", text.replace("Z", "+00:00")))
+        else:
+            d = parsedate_to_datetime(text)
         if d.tzinfo is None:
             d = d.replace(tzinfo=timezone.utc)
         return int(d.timestamp())
@@ -158,6 +160,19 @@ def fetch(url):
     return parse(get(url))
 
 
+def fetch_channel(cid):
+    """YouTube feeds fail at random, so try twice and then the uploads playlist feed."""
+    base = "https://www.youtube.com/feeds/videos.xml?"
+    last = None
+    for url in (base + "channel_id=" + cid, base + "channel_id=" + cid, base + "playlist_id=UU" + cid[2:]):
+        try:
+            return fetch(url)
+        except Exception as e:  # noqa: BLE001
+            last = e
+            time.sleep(3)
+    raise last
+
+
 def google(text):
     raw = get("https://translate.googleapis.com/translate_a/single", {"client": "gtx", "sl": "auto", "tl": "ar", "dt": "t", "q": text})
     return "".join(part[0] for part in json.loads(raw)[0] if part and part[0])
@@ -191,7 +206,9 @@ def channel_id(handle, cache):
     if handle in cache:
         return cache[handle]
     page = get("https://www.youtube.com/" + handle, extra={"Cookie": "CONSENT=YES+1; SOCS=CAI"}).decode("utf-8", "replace")
-    m = re.search(r'"(?:externalId|channelId)":"(UC[\w-]{22})"', page) or re.search(r"channel/(UC[\w-]{22})", page)
+    m = (re.search(r'rel="canonical" href="https://www\.youtube\.com/channel/(UC[\w-]{22})"', page)
+         or re.search(r'"externalId":"(UC[\w-]{22})"', page)
+         or re.search(r'property="og:url" content="https://www\.youtube\.com/channel/(UC[\w-]{22})"', page))
     if not m:
         raise RuntimeError("channel id not found")
     cache[handle] = m.group(1)
@@ -226,19 +243,21 @@ def main():
     for src in jobs:
         try:
             if src["video"]:
-                url = "https://www.youtube.com/feeds/videos.xml?channel_id=" + channel_id(src["handle"], channels)
+                entries = fetch_channel(src.get("id") or channel_id(src["handle"], channels))
             else:
-                url = src["url"]
-            entries = fetch(url)
+                entries = fetch(src["url"])
             if not entries:
                 raise RuntimeError("no items in feed")
             taken = 0
-            for e in entries[:PER_FEED]:
+            limit = now - (VIDEO_AGE_DAYS if src["video"] else MAX_AGE_DAYS) * 86400
+            for e in entries[:SCAN if src.get("only_matching") else PER_FEED]:
+                if taken >= PER_FEED:
+                    break
                 link, title = e["link"].strip(), clean(e["title"], 300)
                 if not link.startswith("http") or not title:
                     continue
                 ts = e["ts"] or now
-                if ts < oldest:
+                if ts < limit:
                     continue
                 if src["video"] and "/shorts/" in link:
                     continue
@@ -257,7 +276,8 @@ def main():
                     "img": "https://i.ytimg.com/vi/%s/hqdefault.jpg" % e["vid"] if e["vid"] else e["img"],
                 })
                 taken += 1
-            status.append({"name": src["name"], "ok": True, "items": taken})
+            status.append({"name": src["name"], "ok": True, "items": taken, "seen": len(entries),
+                           "newest_days": round((now - max(e["ts"] for e in entries)) / 86400, 1) if any(e["ts"] for e in entries) else None})
             print("ok  ", src["name"], taken)
         except Exception as e:  # noqa: BLE001
             status.append({"name": src["name"], "ok": False, "error": (type(e).__name__ + ": " + str(e))[:160]})
@@ -281,7 +301,7 @@ def main():
 
     items, counts = [], {}
     for it in sorted(old.values(), key=lambda it: -it["ts"]):
-        if it["ts"] < oldest:
+        if it["ts"] < (now - VIDEO_AGE_DAYS * 86400 if it.get("video") else oldest):
             continue
         counts[it["sec"]] = counts.get(it["sec"], 0) + 1
         if counts[it["sec"]] <= PER_SECTION:
