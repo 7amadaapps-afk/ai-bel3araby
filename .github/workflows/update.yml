@@ -2,7 +2,7 @@ name: update-news
 
 on:
   schedule:
-    - cron: "7 * * * *"
+    - cron: "13,33,53 * * * *"
   workflow_dispatch:
 
 permissions:
